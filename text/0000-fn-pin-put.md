@@ -11,8 +11,8 @@ Generators (and as such, `async`) are built on top of `FnPinMut`.
 This replaces the eRFC #2033 as the implementation of the functionality first proposed therein.
 
 ```rust
-trait FnPinMut<Args> {
-    type Output;
+trait FnPinMut<Args>: FnOnce<Args> {
+    // type Output; // from FnOnce
     extern "rust-call" fn call_pin(self: Pin<&mut Self>, args: Args) -> Self::Output;
 }
 ```
@@ -36,9 +36,6 @@ pub trait Future {
 
 Specifically, `Future` is isomorphic to `FnPinMut(&mut Context) -> Poll<Output>`.
 
-`FnPinMut` can additionally be further used for other self-referential use cases,
-which include but are not fundamentally limited to:
-
 The primary additional use case that justifies adding `FnPinMut` in addition to
 `Future` is `Generator`s, which are experimentally accepted with eRFC #2033.
 As of writing, `Generator` is defined in nightly as:
@@ -54,8 +51,13 @@ trait Generator {
 and there are ongoing proposals to add optional arguments to `resume`,
 which this RFC provides a potential avenue for.
 
+`FnPinMut` is not fundamentally limited to producing `Generator`,
+and can be used for other potentially self-referential use cases.
+
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
+
+(see reference-level; I've written a reference-level including guide-level like bits)
 
 Explain the proposal as if it was already included in the language and you were teaching it to another Rust programmer. That generally means:
 
@@ -70,13 +72,56 @@ For implementation-oriented RFCs (e.g. for compiler internals), this section sho
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
 
-This is the technical portion of the RFC. Explain the design in sufficient detail that:
+We add a new trait, `FnPinMut`, with the signature above, to `std::ops`.
+It is subject to the same restrictions as the stable `Fn` traits:
+it cannot be named directly (use the `FnPinMut()` form),
+and it cannot be implemented by hand.
+(These restrictions may be lifted in the future.)
 
-- Its interaction with other features is clear.
-- It is reasonably clear how the feature would be implemented.
-- Corner cases are dissected by example.
+An implementation of `FnPinMut` is provided for all closures where said implementation is sound.
+Practically, this means all currently stable `FnMut` closures, as they are `Unpin`, get the following implementation:
 
-The section should return to the examples given in the previous section, and explain more fully how the detailed proposal makes those examples work.
+```rust
+impl FnPinMut<Args> for $GeneratedClosureType {
+    extern "rust-call" fn call_pin(self: Pin<&mut Self>, args: Args) -> Self::Output {
+        (&mut *self).call_mut(args)
+    }
+}
+```
+
+Closures are now allowed to contain **yield expression**s of the form `yield $expr`.
+If a closure contains a yield expression, it _may not_ also contain a return expression.
+This includes the trailing return: a closure containing a `yield` must "return" `!`.
+This will most often be accomplished by a `panic!` or a `loop` at the tail end.
+In most ways (allowed positions, return type), a yield statement acts the same as a return expression.
+
+We call a closure that uses `yield` instead of `return` a **yield closure**.
+
+The key difference is that rather than execution restarting at the top of
+the closure on the next call, execution resumes after the yield statement.
+The compiler will generate a state machine to jump to the correct place upon each resumation.
+
+This is subject to the normal rules about what `Fn` traits are implemented!
+This means that a yield closure can implment all four traits: `Fn`, `FnMut`, `FnPinMut`, and `FnOnce`!
+For example, [`std::iter`'s `Counter` example](counter) can be reimplemented as simply
+
+```rust
+std::iter::from_fn(|| {
+    for count in 1..6 {
+        yield Some(count);
+    }
+    loop {
+        yield None;
+    }
+})
+```
+
+This closure will implement all four `Fn` traits.
+
+So far, however, everything we've seen has been within the domain of the stable `Fn` traits.
+`FnPinMut` is required to support borrowing over `yield` points.
+
+(TODO)
 
 # Drawbacks
 [drawbacks]: #drawbacks
@@ -112,15 +157,13 @@ Please also take into consideration that rust sometimes intentionally diverges f
 
 - Exact naming of `trait FnPinMut`. `FnPinMut` was chosen for this RFC as an
   obvious but somewhat flawed name. `Coroutine` or `Semicoroutine` would also
-  be a good fit for this concept. `Generator` should be reserved for the
-  `GeneratorState`-returning trait for the purpose of semantics, just as
-  `Iterator` is distinct from `FnMut() -> Item`.
-- The exact signiture of `trait Generator`. This RFC suggests potential
-  signatures, but is focused on the `FnPinMut` foundation layer instead.
-
-- What parts of the design do you expect to resolve through the RFC process before this gets merged?
-- What parts of the design do you expect to resolve through the implementation of this feature before stabilization?
-- What related issues do you consider out of scope for this RFC that could be addressed in the future independently of the solution that comes out of this RFC?
+  be a good fit for this concept.
+- The exact fate of `trait Generator`. This RFC suggests focuses on the
+  `FnPinMut` foundation layer instead. `trait Generator` is still a usefull
+  abstraction boundary, just like `Iterator` is distinct from `FnMut() -> Item`.
+- Lifetimes, lifetimes, lifetimes!
+  - Passing in single-yield lifetimes!
+  - Yielding references to closure state!
 
 # Future possibilities
 [future-possibilities]: #future-possibilities
@@ -142,3 +185,5 @@ Note that having something written down in the future-possibilities section
 is not a reason to accept the current or a future RFC; such notes should be
 in the section on motivation or rationale in this or subsequent RFCs.
 The section merely provides additional information.
+
+  [counter]: <https://doc.rust-lang.org/1.39.0/std/iter/index.html#implementing-iterator>
